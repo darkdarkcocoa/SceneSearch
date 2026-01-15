@@ -1,9 +1,12 @@
 """Parse ffmpeg showinfo log and create metadata.json"""
 import re
 import json
+from pathlib import Path
 
-LOG_FILE = "D:/x/VideoRAG/output/frame_log.txt"
-OUTPUT_FILE = "D:/x/VideoRAG/output/metadata.json"
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "output"
+LOG_FILE = OUTPUT_DIR / "frame_log.txt"
+OUTPUT_FILE = OUTPUT_DIR / "metadata.json"
 
 def format_time(seconds):
     """Format seconds to HH:MM:SS"""

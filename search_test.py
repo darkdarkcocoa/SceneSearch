@@ -6,9 +6,12 @@ import numpy as np
 import torch
 import open_clip
 import json
+from pathlib import Path
 
-EMBEDDINGS_FILE = "D:/x/VideoRAG/output/embeddings.npz"
-METADATA_FILE = "D:/x/VideoRAG/output/metadata.json"
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "output"
+EMBEDDINGS_FILE = OUTPUT_DIR / "embeddings.npz"
+METADATA_FILE = OUTPUT_DIR / "metadata.json"
 
 # Load embeddings
 data = np.load(EMBEDDINGS_FILE)

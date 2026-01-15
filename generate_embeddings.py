@@ -9,10 +9,13 @@ from PIL import Image
 import json
 import time
 import os
+from pathlib import Path
 
-METADATA_FILE = "D:/x/VideoRAG/output/metadata.json"
-FRAMES_DIR = "D:/x/VideoRAG/output/frames"
-OUTPUT_FILE = "D:/x/VideoRAG/output/embeddings.npz"
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "output"
+METADATA_FILE = OUTPUT_DIR / "metadata.json"
+FRAMES_DIR = OUTPUT_DIR / "frames"
+OUTPUT_FILE = OUTPUT_DIR / "embeddings.npz"
 
 def main():
     print("=" * 60)

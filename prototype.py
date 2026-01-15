@@ -16,13 +16,15 @@ import open_clip
 from PIL import Image
 import os
 import time
+from pathlib import Path
 
 # ============================================================
 # CONFIG
 # ============================================================
-VIDEO_PATH = "D:/X/VideoRAG/movie.mp4"
-OUTPUT_DIR = "D:/X/VideoRAG/output"
-EMBEDDINGS_FILE = "D:/X/VideoRAG/output/embeddings.npz"
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "output"
+VIDEO_PATH = BASE_DIR / "movie.mp4"  # 사용 시 영상 파일 필요
+EMBEDDINGS_FILE = OUTPUT_DIR / "embeddings.npz"
 FRAME_INTERVAL = 1  # seconds
 
 # ============================================================
