@@ -20,7 +20,13 @@
       "Bash(pip show:*)",
       "Bash(python app.py:*)",
       "Bash(python:*)",
-      "Bash(git remote:*)"
+      "Bash(git remote:*)",
+      "WebFetch(domain:docs.ultralytics.com)",
+      "Bash(timeout /t 5 /nobreak)",
+      "Bash(ping:*)",
+      "Bash(netstat:*)",
+      "Bash(tasklist:*)",
+      "Bash(taskkill //F //PID 6308)"
     ]
   }
 }
