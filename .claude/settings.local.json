@@ -33,7 +33,8 @@
       "mcp__context7__query-docs",
       "Bash(findstr:*)",
       "Bash(taskkill:*)",
-      "Bash(cmd //c \"taskkill /PID 11272 /F\")"
+      "Bash(cmd //c \"taskkill /PID 11272 /F\")",
+      "Bash(tree:*)"
     ]
   }
 }

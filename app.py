@@ -245,13 +245,149 @@ def search(query: str, top_k: int, search_mode: str):
 
     # Store timestamps globally for gallery click handler
     search_results_timestamps = timestamps
+    
+    # Collect top scores for visualization
+    top_scores = [float(scores[idx]) for idx in top_indices]
+    total_time = (encode_time + search_time) * 1000
+    
+    # ===== Generate Scatter Plot Data =====
+    all_scores = scores.tolist()
+    min_score, max_score = min(all_scores), max(all_scores)
+    score_range = max_score - min_score if max_score > min_score else 0.1
+    
+    # SVG dimensions
+    svg_w, svg_h = 500, 120
+    pad_l, pad_r, pad_t, pad_b = 35, 10, 10, 25
+    plot_w = svg_w - pad_l - pad_r
+    plot_h = svg_h - pad_t - pad_b
+    
+    # Sample frames for performance (max 200 points)
+    total_frames_count = len(all_scores)
+    if total_frames_count > 200:
+        step = total_frames_count // 200
+        sample_idx = list(range(0, total_frames_count, step))
+    else:
+        sample_idx = list(range(total_frames_count))
+    
+    # Get max timestamp
+    max_ts = max(frames[i].get('timestamp', i) for i in sample_idx) if sample_idx else 1
+    
+    # Scale functions
+    def sx(ts): return pad_l + (ts / max_ts) * plot_w if max_ts > 0 else pad_l
+    def sy(sc): return pad_t + plot_h - ((sc - min_score) / score_range) * plot_h
+    
+    # Generate background dots (sampled frames)
+    dots = ""
+    for i in sample_idx:
+        ts = frames[i].get('timestamp', i)
+        sc = all_scores[i]
+        x, y = sx(ts), sy(sc)
+        dots += f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.5" fill="#3d4555" opacity="0.5"><title>{format_time(ts)} | Score: {sc:.3f}</title></circle>'
+    
+    # Generate top result stars with glow effect
+    top_dots = ""
+    for rank, idx in enumerate(top_indices):
+        ts = frames[idx].get('timestamp', idx)
+        sc = all_scores[idx]
+        x, y = sx(ts), sy(sc)
+        top_dots += f'''
+        <circle cx="{x:.1f}" cy="{y:.1f}" r="14" fill="#667eea" opacity="0.2" class="pulse-ring"/>
+        <circle cx="{x:.1f}" cy="{y:.1f}" r="7" fill="#667eea" stroke="#a78bfa" stroke-width="2" class="top-dot"/>
+        <text x="{x:.1f}" y="{y - 12:.1f}" text-anchor="middle" fill="#e2e8f0" font-size="9" font-weight="bold">#{rank+1}</text>
+        <title>#{rank+1} | {format_time(ts)} | Score: {sc:.3f}</title>
+        '''
+    
+    # Top results summary
+    top_results_html = ""
+    for i, (sc, ts) in enumerate(zip(top_scores[:5], timestamps[:5])):
+        top_results_html += f'<div style="display:flex; justify-content:space-between; padding:4px 8px; background:#252a34; border-radius:4px; margin-bottom:4px;"><span style="color:#667eea;">#{i+1}</span><span style="color:#a0aec0;">{format_time(ts)}</span><span style="color:#48bb78;">{sc:.3f}</span></div>'
 
-    # Stats Bar
+    # Visualization HTML
     stats = f"""
-    <div style='display: flex; justify-content: center; align-items: center; gap: 3rem; padding: 0.8rem 1.5rem; background: linear-gradient(135deg, #1a1d24 0%, #252a34 100%); border-radius: 12px; font-size: 0.95rem; color: #a0aec0; border: 1px solid #2d3748; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);'>
-        <span>🔎 <strong style="color: #e2e8f0;">{len(frames):,}</strong> Frames</span>
-        <span>⚙️ <strong style="color: #667eea;">{mode_desc}</strong></span>
-        <span>⚡ <strong style="color: #48bb78;">{(encode_time + search_time)*1000:.1f}ms</strong></span>
+    <div style="background: linear-gradient(135deg, #1a1d24 0%, #252a34 100%); border-radius: 16px; padding: 20px; border: 1px solid #2d3748; margin-bottom: 20px;">
+        
+        <div style="text-align: center; margin-bottom: 20px;">
+            <span style="font-size: 1.2rem; font-weight: 600; color: #e2e8f0;">🔮 Search Pipeline</span>
+        </div>
+        
+        <div style="display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 24px; flex-wrap: wrap;">
+            <div style="background: #2d3748; padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
+                <div style="font-size: 1.5rem;">📝</div>
+                <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">Query</div>
+                <div style="color: #e2e8f0; font-size: 0.85rem; font-weight: 500; margin-top: 2px;">"{query[:15]}{"..." if len(query) > 15 else ""}"</div>
+            </div>
+            <div style="color: #667eea; font-size: 1.2rem;">→</div>
+            <div style="background: #2d3748; padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
+                <div style="font-size: 1.5rem;">🧠</div>
+                <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">CLIP Encode</div>
+                <div style="color: #48bb78; font-size: 0.85rem; font-weight: 500; margin-top: 2px;">{encode_time*1000:.1f}ms</div>
+            </div>
+            <div style="color: #667eea; font-size: 1.2rem;">→</div>
+            <div style="background: #2d3748; padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
+                <div style="font-size: 1.5rem;">🔢</div>
+                <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">Cosine Similarity</div>
+                <div style="color: #48bb78; font-size: 0.85rem; font-weight: 500; margin-top: 2px;">{len(frames):,} frames</div>
+            </div>
+            <div style="color: #667eea; font-size: 1.2rem;">→</div>
+            <div style="background: #2d3748; padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
+                <div style="font-size: 1.5rem;">📊</div>
+                <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">Rank & Select</div>
+                <div style="color: #48bb78; font-size: 0.85rem; font-weight: 500; margin-top: 2px;">Top {top_k}</div>
+            </div>
+            <div style="color: #667eea; font-size: 1.2rem;">→</div>
+            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
+                <div style="font-size: 1.5rem;">✨</div>
+                <div style="color: rgba(255,255,255,0.8); font-size: 0.75rem; margin-top: 4px;">Results</div>
+                <div style="color: white; font-size: 0.85rem; font-weight: 600; margin-top: 2px;">{len(results)} found</div>
+            </div>
+        </div>
+        
+        <div style="display: flex; justify-content: center; gap: 24px; margin-bottom: 20px; flex-wrap: wrap;">
+            <div style="text-align: center;">
+                <div style="color: #a0aec0; font-size: 0.75rem;">Mode</div>
+                <div style="color: #667eea; font-weight: 600;">{mode_desc}</div>
+            </div>
+            <div style="text-align: center;">
+                <div style="color: #a0aec0; font-size: 0.75rem;">Weights</div>
+                <div style="color: #e2e8f0; font-weight: 500;">IMG {w_img:.0%} / TXT {w_txt:.0%}</div>
+            </div>
+            <div style="text-align: center;">
+                <div style="color: #a0aec0; font-size: 0.75rem;">Total Time</div>
+                <div style="color: #48bb78; font-weight: 600;">{total_time:.1f}ms</div>
+            </div>
+        </div>
+        
+        <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+            <div style="flex: 2; min-width: 280px;">
+                <div style="color: #a0aec0; font-size: 0.8rem; margin-bottom: 8px; text-align: center;">
+                    📈 Similarity Timeline (★ = top results, hover for details)
+                </div>
+                <style>
+                    .pulse-ring {{ animation: pulse 2s ease-in-out infinite; }}
+                    .top-dot {{ filter: drop-shadow(0 0 4px #667eea); }}
+                    @keyframes pulse {{ 0%,100% {{ opacity:0.2; r:14; }} 50% {{ opacity:0.4; r:18; }} }}
+                </style>
+                <svg viewBox="0 0 {svg_w} {svg_h}" style="width:100%; background:#1a1d24; border-radius:8px; overflow:visible;">
+                    <line x1="{pad_l}" y1="{svg_h - pad_b}" x2="{svg_w - pad_r}" y2="{svg_h - pad_b}" stroke="#2d3748"/>
+                    <line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{svg_h - pad_b}" stroke="#2d3748"/>
+                    <text x="{pad_l - 3}" y="{pad_t + 4}" text-anchor="end" fill="#718096" font-size="8">{max_score:.2f}</text>
+                    <text x="{pad_l - 3}" y="{svg_h - pad_b}" text-anchor="end" fill="#718096" font-size="8">{min_score:.2f}</text>
+                    <text x="{pad_l}" y="{svg_h - 8}" fill="#718096" font-size="8">0:00</text>
+                    <text x="{svg_w - pad_r}" y="{svg_h - 8}" text-anchor="end" fill="#718096" font-size="8">{format_time(max_ts)}</text>
+                    {dots}
+                    {top_dots}
+                </svg>
+            </div>
+            <div style="flex: 1; min-width: 180px;">
+                <div style="color: #a0aec0; font-size: 0.8rem; margin-bottom: 8px; text-align: center;">
+                    🏆 Top Matches
+                </div>
+                <div style="background: #1a1d24; border-radius: 8px; padding: 8px;">
+                    {top_results_html}
+                </div>
+            </div>
+        </div>
+        
     </div>
     """
 
@@ -832,6 +968,6 @@ if __name__ == "__main__":
     app = create_app()
     app.launch(
         server_name="127.0.0.1",
-        server_port=7860,
+        server_port=7880,
         inbrowser=True
     )

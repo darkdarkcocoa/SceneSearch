@@ -10,8 +10,10 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output"
-EMBEDDINGS_FILE = OUTPUT_DIR / "embeddings.npz"
-METADATA_FILE = OUTPUT_DIR / "metadata.json"
+MOVIE_NAME = "Transcendence"
+MOVIE_DIR = OUTPUT_DIR / MOVIE_NAME
+EMBEDDINGS_FILE = MOVIE_DIR / "embeddings.npz"
+METADATA_FILE = MOVIE_DIR / "metadata.json"
 
 # Load embeddings
 data = np.load(EMBEDDINGS_FILE)
