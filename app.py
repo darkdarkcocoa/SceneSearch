@@ -13,6 +13,7 @@ import shutil
 import re
 import os
 import threading
+import base64
 from pathlib import Path
 from PIL import Image
 import google.generativeai as genai
@@ -39,6 +40,53 @@ current_movie = None  # Currently loaded movie name
 search_results_timestamps = []  # Store timestamps for gallery clicks
 stop_event = threading.Event()  # Stop signal for processing
 current_ffmpeg_proc = None  # Reference to running ffmpeg process
+
+# Benchmark models definition
+BENCHMARK_MODELS = {
+    'ViT-B-32': {'pretrained': 'openai', 'dim': 512, 'params': '88M', 'patch': 32, 'desc': 'Fastest, lowest accuracy', 'hf_repo': 'timm/vit_base_patch32_clip_224.openai'},
+    'ViT-B-16': {'pretrained': 'openai', 'dim': 512, 'params': '86M', 'patch': 16, 'desc': 'Best speed/accuracy balance', 'hf_repo': 'timm/vit_base_patch16_clip_224.openai'},
+    'ViT-L-14': {'pretrained': 'openai', 'dim': 768, 'params': '304M', 'patch': 14, 'desc': 'High accuracy, slower', 'hf_repo': 'timm/vit_large_patch14_clip_224.openai'},
+    'ViT-H-14': {'pretrained': 'laion2b_s32b_b79k', 'dim': 1024, 'params': '632M', 'patch': 14, 'desc': 'Very high accuracy', 'hf_repo': 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K'},
+    'ViT-g-14': {'pretrained': 'laion2b_s34b_b88k', 'dim': 1024, 'params': '1.8B', 'patch': 14, 'desc': 'Highest accuracy, slowest', 'hf_repo': 'laion/CLIP-ViT-g-14-laion2B-s34B-b88K'},
+}
+
+def is_model_downloaded(model_name):
+    """Check if a CLIP model is already downloaded in HuggingFace cache"""
+    try:
+        from huggingface_hub import scan_cache_dir
+        info = scan_cache_dir()
+        hf_repo = BENCHMARK_MODELS.get(model_name, {}).get('hf_repo', '')
+        return any(r.repo_id == hf_repo for r in info.repos)
+    except Exception:
+        return False
+
+def download_model(model_name):
+    """Download a CLIP model to local cache (generator for progress)"""
+    info = BENCHMARK_MODELS.get(model_name)
+    if not info:
+        yield f"❌ Unknown model: {model_name}", ""
+        return
+    
+    if is_model_downloaded(model_name):
+        yield f"✅ {model_name} is already installed", ""
+        return
+    
+    yield f"⬇️ Downloading {model_name} ({info['params']})...", f"""
+    <div style="background:#1a1d24; border-radius:10px; padding:12px; border:1px solid #2d3748;">
+        <div style="color:#e2e8f0; font-size:0.85rem; margin-bottom:6px;">⬇️ Downloading {model_name}...</div>
+        <div style="background:#2d3748; border-radius:6px; height:6px; overflow:hidden;">
+            <div style="background:linear-gradient(90deg,#667eea,#764ba2); height:100%; width:100%; border-radius:6px; animation:pulse 1.5s ease-in-out infinite;"></div>
+        </div>
+        <div style="color:#718096; font-size:0.7rem; margin-top:4px;">This may take a few minutes depending on your connection</div>
+    </div>"""
+    
+    try:
+        m, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=info['pretrained'])
+        del m
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        yield f"✅ {model_name} downloaded successfully!", ""
+    except Exception as e:
+        yield f"❌ Failed to download {model_name}: {e}", ""
 
 # ============================================================
 # UTILS
@@ -293,26 +341,9 @@ def search(query: str, top_k: int, search_mode: str):
         search_results_timestamps = []
         return [], "", []
 
-    # 0. Translate Korean to English if needed
+    # 0. (Translation disabled - English only for now)
     original_query = query
     translated_query = None
-    if contains_korean(query):
-        translated_query, translation_error = translate_to_english(query)
-        if translation_error:
-            error_html = f"""
-            <div style="background: linear-gradient(135deg, #5c1a1a 0%, #2d2020 100%); border-radius: 12px; padding: 20px; border: 1px solid #ef4444; text-align: center;">
-                <div style="font-size: 2.5rem; margin-bottom: 12px;">🚫</div>
-                <div style="color: #fca5a5; font-size: 1.1rem; font-weight: 600; margin-bottom: 8px;">번역 실패</div>
-                <div style="color: #f87171; font-size: 0.9rem; margin-bottom: 12px;">{translation_error}</div>
-                <div style="color: #a1a1aa; font-size: 0.8rem; padding: 10px; background: #1f1f1f; border-radius: 8px; font-family: monospace;">
-                    Query: "{original_query}"
-                </div>
-            </div>
-            """
-            search_results_timestamps = []
-            return [], error_html, []
-        else:
-            query = translated_query
 
     # 1. Encode Query
     t0 = time.perf_counter()
@@ -610,10 +641,11 @@ def on_gallery_select(evt: gr.SelectData, timestamps_state):
 # PROCESSING ENGINE
 # ============================================================
 def make_progress_html(phase, current=0, total=0, fps=0, eta=0, caption=""):
-    """Generate HTML progress bar for processing stages"""
+    """Generate HTML progress bar with step indicator cards"""
     hint = ""
+    caption_html = ""
+    
     if phase == "extract":
-        # current=last_pts_time, total=video_duration, eta=frame_count_found
         pct = (current / total * 100) if total > 0 else 0
         frame_count = int(eta)
         status_icon = "🎬"
@@ -640,7 +672,8 @@ def make_progress_html(phase, current=0, total=0, fps=0, eta=0, caption=""):
         eta_str = f"{int(eta//60)}분 {int(eta%60)}초" if eta >= 60 else f"{eta:.0f}초"
         sub_text = f"처리 속도: {fps:.1f} frames/sec · 남은 시간: {eta_str}"
         if caption:
-            sub_text += f'<br>📝 "{caption[:60]}..."' if len(caption) > 60 else f'<br>📝 "{caption}"'
+            cap_text = caption[:55] + '...' if len(caption) > 55 else caption
+            caption_html = f'<div style="color:#a78bfa; font-size:0.75rem; margin-top:6px; height:20px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📝 {cap_text}</div>'
         bar_color = "linear-gradient(90deg, #667eea, #764ba2)"
         pulse = False
         hint = "💡 CLIP으로 이미지 임베딩, BLIP으로 캡션 생성 후 캡션도 임베딩합니다"
@@ -678,21 +711,80 @@ def make_progress_html(phase, current=0, total=0, fps=0, eta=0, caption=""):
     bar_width = "100%" if pulse else f"{pct}%"
     pct_display = f'<div style="color: #667eea; font-size: 1.3rem; font-weight: 700;">{pct:.1f}%</div>' if not pulse else ""
 
+    # Step indicator cards
+    steps = [
+        ("extract", "🎬", "Extract"),
+        ("model_load", "🧠", "Model"),
+        ("analyze", "⚡", "Analyze"),
+        ("save", "💾", "Save"),
+        ("done", "✅", "Done"),
+    ]
+    step_order = [s[0] for s in steps]
+    current_idx = step_order.index(phase) if phase in step_order else -1
+    
+    step_cards = ""
+    for i, (step_id, icon, label) in enumerate(steps):
+        if phase == "stopped":
+            # stopped state
+            bg = "#1a1d24"
+            border = "1px solid #2d3748"
+            label_color = "#4a5568"
+            icon_opacity = "0.4"
+            glow = ""
+        elif i < current_idx:
+            # completed step
+            bg = "linear-gradient(135deg, #1a3a2a 0%, #1a2e1a 100%)"
+            border = "1px solid #22c55e44"
+            label_color = "#48bb78"
+            icon_opacity = "0.9"
+            glow = ""
+        elif i == current_idx:
+            # active step
+            bg = "linear-gradient(135deg, #1e2a5f 0%, #2d1b69 100%)"
+            border = "1px solid #667eea"
+            label_color = "#e2e8f0"
+            icon_opacity = "1"
+            glow = "box-shadow: 0 0 12px rgba(102, 126, 234, 0.4);"
+        else:
+            # future step
+            bg = "#1a1d24"
+            border = "1px solid #2d3748"
+            label_color = "#4a5568"
+            icon_opacity = "0.4"
+            glow = ""
+        
+        connector = ""
+        if i < len(steps) - 1:
+            conn_color = "#22c55e" if i < current_idx else ("#667eea" if i == current_idx else "#2d3748")
+            connector = f'<div style="color:{conn_color}; font-size:0.7rem; display:flex; align-items:center; opacity:0.8;">▸</div>'
+        
+        step_cards += f'''<div style="display:flex; align-items:center; gap:4px;">
+            <div style="background:{bg}; border:{border}; border-radius:10px; padding:6px 10px; text-align:center; min-width:55px; transition: all 0.3s ease; {glow}">
+                <div style="font-size:1rem; opacity:{icon_opacity};">{icon}</div>
+                <div style="color:{label_color}; font-size:0.65rem; font-weight:600; margin-top:2px;">{label}</div>
+            </div>
+            {connector}
+        </div>'''
+
     return f"""
     <style>{pulse_css}</style>
-    <div style="background: #1a1d24; border-radius: 16px; padding: 24px; border: 1px solid #2d3748;">
-        <div style="display: flex; align-items: center; gap: 16px; margin-bottom: 16px;">
-            <div style="font-size: 2rem;">{status_icon}</div>
-            <div style="flex: 1;">
-                <div style="color: #e2e8f0; font-size: 1.1rem; font-weight: 600;">{status_text}</div>
-                <div style="color: #718096; font-size: 0.85rem; margin-top: 2px;">{sub_text}</div>
+    <div style="background: #1a1d24; border-radius: 16px; padding: 20px; border: 1px solid #2d3748;">
+        <div style="display:flex; align-items:center; justify-content:center; gap:4px; margin-bottom:14px; flex-wrap:wrap;">
+            {step_cards}
+        </div>
+        <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 12px; min-height: 52px;">
+            <div style="font-size: 1.8rem;">{status_icon}</div>
+            <div style="flex: 1; min-width: 0;">
+                <div style="color: #e2e8f0; font-size: 1rem; font-weight: 600;">{status_text}</div>
+                <div style="color: #718096; font-size: 0.8rem; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{sub_text}</div>
+                {caption_html}
             </div>
             {pct_display}
         </div>
-        <div style="background: #2d3748; border-radius: 8px; height: 12px; overflow: hidden;">
+        <div style="background: #2d3748; border-radius: 8px; height: 10px; overflow: hidden;">
             <div style="background: {bar_color}; height: 100%; border-radius: 8px; width: {bar_width}; transition: width 0.3s ease; {pulse_style}"></div>
         </div>
-        {f'<div style="color:#5a6577; font-size:0.75rem; margin-top:10px; text-align:center;">{hint}</div>' if hint else ''}
+        {f'<div style="color:#5a6577; font-size:0.7rem; margin-top:8px; text-align:center;">{hint}</div>' if hint else ''}
     </div>
     """
 
@@ -885,6 +977,554 @@ def process_video(video_file, scene_threshold):
         import traceback
         err = traceback.format_exc()
         yield log(f"❌ Error:\n{err}"), make_progress_html("stopped", 0, 0, 0, 0), None
+
+# ============================================================ 
+# BENCHMARK ENGINE
+# ============================================================ 
+def get_benchmark_emb_path(movie_name, model_name):
+    """Get embeddings file path for a specific model"""
+    slug = model_name.replace('-', '_')
+    return OUTPUT_DIR / movie_name / f'embeddings_{slug}.npz'
+
+def benchmark_check_status(movie_name):
+    """Check which models have embeddings for a given movie"""
+    if not movie_name:
+        return {}
+    status = {}
+    for model_name in BENCHMARK_MODELS:
+        path = get_benchmark_emb_path(movie_name, model_name)
+        # ViT-B-32 also uses the default embeddings.npz
+        if model_name == 'ViT-B-32':
+            default_path = get_movie_paths(movie_name)['embeddings']
+            status[model_name] = path.exists() or default_path.exists()
+        else:
+            status[model_name] = path.exists()
+    return status
+
+def benchmark_generate(movie_name, model_name):
+    """Generate embeddings for a movie with a specific CLIP model (generator)"""
+    paths = get_movie_paths(movie_name)
+    frames_dir = paths['frames']
+    metadata_path = paths['metadata']
+    
+    if not frames_dir.exists() or not metadata_path.exists():
+        yield "❌ Movie not processed yet. Run Process tab first.", "", None
+        return
+    
+    with open(metadata_path, 'r', encoding='utf-8') as f:
+        meta = json.load(f)
+    frame_list = meta['frames']
+    total = len(frame_list)
+    
+    if total == 0:
+        yield "❌ No frames found.", "", None
+        return
+    
+    model_info = BENCHMARK_MODELS[model_name]
+    out_path = get_benchmark_emb_path(movie_name, model_name)
+    
+    yield f"🧠 Loading {model_name}...", _bench_progress_html(model_name, "loading", 0, total), None
+    
+    proc_device = get_device()
+    try:
+        m, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained=model_info['pretrained'])
+        m = m.to(proc_device).eval()
+        tok = open_clip.get_tokenizer(model_name)
+    except Exception as e:
+        yield f"❌ Failed to load {model_name}: {e}", "", None
+        return
+    
+    # BLIP for captions (reuse if already have captions)
+    has_captions = all(f.get('caption') for f in frame_list)
+    b_processor, b_model = None, None
+    if not has_captions:
+        yield f"🧠 Loading BLIP for captions...", _bench_progress_html(model_name, "loading", 0, total), None
+        from transformers import BlipProcessor, BlipForConditionalGeneration
+        b_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+        b_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large").to(proc_device)
+    
+    yield f"⚡ Encoding frames with {model_name}...", _bench_progress_html(model_name, "encoding", 0, total), None
+    
+    img_embs = []
+    txt_embs = []
+    t_start = time.perf_counter()
+    
+    for i, frame_info in enumerate(frame_list):
+        img_path = frames_dir / frame_info['filename']
+        if not img_path.exists():
+            continue
+        
+        img = Image.open(img_path).convert('RGB')
+        
+        # Image embedding
+        img_tensor = preprocess(img).unsqueeze(0).to(proc_device)
+        with torch.no_grad():
+            img_emb = m.encode_image(img_tensor)
+            img_emb /= img_emb.norm(dim=-1, keepdim=True)
+        img_embs.append(img_emb.cpu().numpy().flatten())
+        
+        # Caption
+        caption = frame_info.get('caption', '')
+        if not caption and b_processor and b_model:
+            inputs = b_processor(images=img, return_tensors="pt").to(proc_device)
+            with torch.no_grad():
+                out = b_model.generate(**inputs, max_new_tokens=50)
+            caption = b_processor.decode(out[0], skip_special_tokens=True)
+            frame_info['caption'] = caption
+        
+        # Caption text embedding
+        if caption:
+            cap_tokens = tok([caption])
+            with torch.no_grad():
+                cap_emb = m.encode_text(cap_tokens.to(proc_device))
+                cap_emb /= cap_emb.norm(dim=-1, keepdim=True)
+            txt_embs.append(cap_emb.cpu().numpy().flatten())
+        else:
+            txt_embs.append(np.zeros(model_info['dim']))
+        
+        if (i + 1) % 5 == 0 or i == total - 1:
+            elapsed = time.perf_counter() - t_start
+            fps = (i + 1) / elapsed if elapsed > 0 else 0
+            eta = (total - i - 1) / fps if fps > 0 else 0
+            pct = (i + 1) / total * 100
+            cap_preview = caption[:50] + '...' if len(caption) > 50 else caption
+            yield (
+                f"⚡ {model_name}: {i+1}/{total} ({pct:.0f}%) | {fps:.1f} fps | ETA {eta:.0f}s\n📝 {cap_preview}",
+                _bench_progress_html(model_name, "encoding", i + 1, total, fps, eta),
+                None
+            )
+    
+    # Save
+    elapsed_total = time.perf_counter() - t_start
+    np.savez_compressed(str(out_path),
+                        image_embeddings=np.array(img_embs),
+                        text_embeddings=np.array(txt_embs))
+    
+    # Update metadata if new captions were generated
+    if not has_captions:
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    
+    # Cleanup GPU
+    del m, tok
+    if b_model:
+        del b_processor, b_model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    yield (
+        f"✅ {model_name} done! {total} frames in {elapsed_total:.1f}s ({total/elapsed_total:.1f} fps)",
+        _bench_progress_html(model_name, "done", total, total),
+        None
+    )
+
+def _bench_progress_html(model_name, phase, current, total, fps=0, eta=0):
+    """Generate compact progress HTML for benchmark"""
+    pct = (current / total * 100) if total > 0 else 0
+    info = BENCHMARK_MODELS.get(model_name, {})
+    
+    if phase == "loading":
+        status = "Loading model..."
+        bar_color = "#f59e0b"
+        pct = 0
+    elif phase == "encoding":
+        eta_str = f"{eta:.0f}s" if eta < 60 else f"{int(eta//60)}m {int(eta%60)}s"
+        status = f"{current}/{total} frames · {fps:.1f} fps · ETA {eta_str}"
+        bar_color = "#667eea"
+    elif phase == "done":
+        status = f"Complete — {total} frames"
+        bar_color = "#48bb78"
+        pct = 100
+    else:
+        status = "Ready"
+        bar_color = "#4a5568"
+    
+    return f"""
+    <div style="background:#1a1d24; border-radius:12px; padding:14px; border:1px solid #2d3748; margin-bottom:8px;">
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
+            <span style="color:#e2e8f0; font-weight:600;">{model_name}</span>
+            <span style="color:#718096; font-size:0.75rem;">{info.get('params','')} · {info.get('dim','')}d</span>
+        </div>
+        <div style="color:#a0aec0; font-size:0.8rem; margin-bottom:6px;">{status}</div>
+        <div style="background:#2d3748; border-radius:6px; height:8px; overflow:hidden;">
+            <div style="background:{bar_color}; height:100%; width:{pct}%; border-radius:6px; transition:width 0.3s;"></div>
+        </div>
+    </div>
+    """
+
+def benchmark_search_compare(movie_name, model_names, query, top_k=8):
+    """Run search with multiple models and return comparison HTML"""
+    if not movie_name or not query.strip():
+        return "<p style='color:#718096; text-align:center;'>Select a movie and enter a query</p>", []
+    
+    paths = get_movie_paths(movie_name)
+    frames_dir = paths['frames']
+    metadata_path = paths['metadata']
+    
+    if not metadata_path.exists():
+        return "<p style='color:#fc8181; text-align:center;'>Movie not processed</p>", []
+    
+    with open(metadata_path, 'r', encoding='utf-8') as f:
+        meta = json.load(f)
+    frame_list = meta['frames']
+    
+    # (Translation disabled - English only for now)
+    search_query = query
+    translated = None
+    
+    results_per_model = {}
+    
+    for model_name in model_names:
+        info = BENCHMARK_MODELS[model_name]
+        
+        # Load embeddings
+        emb_path = get_benchmark_emb_path(movie_name, model_name)
+        if not emb_path.exists() and model_name == 'ViT-B-32':
+            emb_path = paths['embeddings']
+        
+        if not emb_path.exists():
+            results_per_model[model_name] = {'error': 'Embeddings not found. Prepare this model first.'}
+            continue
+        
+        data = np.load(str(emb_path))
+        img_embs = data.get('image_embeddings', data.get('embeddings'))
+        txt_embs = data.get('text_embeddings')
+        
+        # Load model
+        t_load = time.perf_counter()
+        try:
+            m, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=info['pretrained'])
+            m = m.to(get_device()).eval()
+            tok = open_clip.get_tokenizer(model_name)
+        except Exception as e:
+            results_per_model[model_name] = {'error': f'Model load failed: {e}'}
+            continue
+        load_time = time.perf_counter() - t_load
+        
+        # Encode query
+        t_enc = time.perf_counter()
+        text_tokens = tok([search_query])
+        with torch.no_grad():
+            q_emb = m.encode_text(text_tokens.to(get_device()))
+            q_emb /= q_emb.norm(dim=-1, keepdim=True)
+        q_emb = q_emb.cpu().numpy().flatten()
+        encode_time = time.perf_counter() - t_enc
+        
+        # Search
+        t_search = time.perf_counter()
+        img_scores = img_embs @ q_emb
+        if txt_embs is not None and len(txt_embs) > 0:
+            txt_scores = txt_embs @ q_emb
+            scores = img_scores * 0.6 + txt_scores * 0.4
+        else:
+            scores = img_scores
+        
+        top_idx = np.argsort(scores)[::-1][:top_k]
+        search_time = time.perf_counter() - t_search
+        
+        # VRAM
+        vram_mb = 0
+        if torch.cuda.is_available():
+            vram_mb = torch.cuda.memory_allocated() / 1024 / 1024
+        
+        # Collect results
+        top_results = []
+        for idx in top_idx:
+            frame = frame_list[idx]
+            img_path = frames_dir / frame['filename']
+            if img_path.exists():
+                top_results.append({
+                    'path': str(img_path),
+                    'score': float(scores[idx]),
+                    'time_str': frame.get('time_str', ''),
+                    'timestamp': frame.get('timestamp', 0),
+                    'caption': frame.get('caption', ''),
+                })
+        
+        results_per_model[model_name] = {
+            'results': top_results,
+            'load_time': load_time,
+            'encode_time': encode_time,
+            'search_time': search_time,
+            'total_time': (load_time + encode_time + search_time),
+            'vram_mb': vram_mb,
+            'dim': info['dim'],
+            'params': info['params'],
+        }
+        
+        # Cleanup
+        del m, tok
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    # Build comparison HTML
+    html = _build_comparison_html(results_per_model, query, translated, top_k)
+    
+    # Build galleries per model (for Gradio gallery display)
+    all_galleries = []
+    for model_name in model_names:
+        r = results_per_model.get(model_name, {})
+        if 'error' in r:
+            all_galleries.append([])
+        else:
+            gallery = [(item['path'], f"⏱️ {item['time_str']} | {item['score']:.3f}") for item in r.get('results', [])]
+            all_galleries.append(gallery)
+    
+    return html, all_galleries
+
+def _img_to_data_uri(path, max_w=320):
+    """Convert image file to base64 data URI (resized for thumbnails)"""
+    try:
+        img = Image.open(path).convert('RGB')
+        if img.width > max_w:
+            ratio = max_w / img.width
+            img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
+        import io
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=70)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception:
+        return ""
+
+def _build_comparison_html(results_per_model, query, translated, top_k):
+    """Build rich comparison HTML for benchmark results"""
+    model_names = list(results_per_model.keys())
+    
+    # Translation badge
+    trans_html = ""
+    if translated:
+        trans_html = f"""
+        <div style="background:linear-gradient(135deg,#1e3a5f,#2d3748); border-radius:10px; padding:10px 16px; margin-bottom:16px; border:1px solid #3b82f6; display:flex; align-items:center; gap:10px;">
+            <span style="font-size:1.2rem;">🌐</span>
+            <span style="color:#e2e8f0;">{query}</span>
+            <span style="color:#3b82f6;">→</span>
+            <span style="color:#60a5fa; font-weight:600;">{translated}</span>
+        </div>
+        """
+    
+    # Metrics comparison cards
+    metrics_cards = ""
+    colors = ['#667eea', '#f59e0b', '#48bb78', '#ec4899', '#ef4444']
+    
+    for i, model_name in enumerate(model_names):
+        r = results_per_model[model_name]
+        color = colors[i % len(colors)]
+        
+        if 'error' in r:
+            metrics_cards += f"""
+            <div style="flex:1; min-width:200px; background:#1a1d24; border-radius:12px; padding:16px; border:1px solid #2d3748;">
+                <div style="color:{color}; font-weight:700; font-size:1rem; margin-bottom:8px;">{model_name}</div>
+                <div style="color:#fc8181; font-size:0.85rem;">{r['error']}</div>
+            </div>"""
+            continue
+        
+        top_score = r['results'][0]['score'] if r['results'] else 0
+        total_ms = r['total_time'] * 1000
+        search_ms = r['search_time'] * 1000
+        
+        metrics_cards += f"""
+        <div style="flex:1; min-width:220px; background:#1a1d24; border-radius:12px; padding:16px; border:1px solid {color}33; position:relative; overflow:hidden;">
+            <div style="position:absolute; top:0; left:0; right:0; height:3px; background:{color};"></div>
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+                <span style="color:{color}; font-weight:700; font-size:1.05rem;">{model_name}</span>
+                <span style="color:#4a5568; font-size:0.7rem; background:#252a34; padding:2px 8px; border-radius:10px;">{r['params']} · {r['dim']}d</span>
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+                <div style="background:#252a34; border-radius:8px; padding:8px 10px;">
+                    <div style="color:#718096; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.5px;">Top Score</div>
+                    <div style="color:#e2e8f0; font-size:1.1rem; font-weight:700;">{top_score:.4f}</div>
+                </div>
+                <div style="background:#252a34; border-radius:8px; padding:8px 10px;">
+                    <div style="color:#718096; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.5px;">Search</div>
+                    <div style="color:#48bb78; font-size:1.1rem; font-weight:700;">{search_ms:.1f}ms</div>
+                </div>
+                <div style="background:#252a34; border-radius:8px; padding:8px 10px;">
+                    <div style="color:#718096; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.5px;">Total</div>
+                    <div style="color:#a0aec0; font-size:1.1rem; font-weight:700;">{total_ms:.0f}ms</div>
+                </div>
+                <div style="background:#252a34; border-radius:8px; padding:8px 10px;">
+                    <div style="color:#718096; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.5px;">VRAM</div>
+                    <div style="color:#a0aec0; font-size:1.1rem; font-weight:700;">{r['vram_mb']:.0f}MB</div>
+                </div>
+            </div>
+        </div>"""
+    
+    # Score comparison bar chart (top-1 scores)
+    bar_chart = ""
+    valid_models = [(m, r) for m, r in results_per_model.items() if 'results' in r and r['results']]
+    if len(valid_models) >= 2:
+        max_score = max(r['results'][0]['score'] for _, r in valid_models)
+        bars = ""
+        for i, (m, r) in enumerate(valid_models):
+            score = r['results'][0]['score']
+            width_pct = (score / max_score * 100) if max_score > 0 else 0
+            color = colors[i % len(colors)]
+            bars += f"""
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
+                <div style="width:70px; color:{color}; font-size:0.8rem; font-weight:600; text-align:right;">{m}</div>
+                <div style="flex:1; background:#252a34; border-radius:4px; height:24px; overflow:hidden;">
+                    <div style="background:{color}; height:100%; width:{width_pct:.1f}%; border-radius:4px; display:flex; align-items:center; justify-content:flex-end; padding-right:8px;">
+                        <span style="color:white; font-size:0.7rem; font-weight:600;">{score:.4f}</span>
+                    </div>
+                </div>
+            </div>"""
+        
+        bar_chart = f"""
+        <div style="background:#1a1d24; border-radius:12px; padding:16px; border:1px solid #2d3748; margin-top:16px;">
+            <div style="color:#a0aec0; font-size:0.85rem; font-weight:600; margin-bottom:12px;">📊 Top-1 Score Comparison</div>
+            {bars}
+        </div>"""
+    
+    # Result thumbnails side by side
+    thumbs_html = ""
+    if len(valid_models) >= 2:
+        cols = ""
+        for i, (m, r) in enumerate(valid_models):
+            color = colors[i % len(colors)]
+            imgs = ""
+            for j, item in enumerate(r['results'][:4]):
+                data_uri = _img_to_data_uri(item['path'])
+                imgs += f"""
+                <div style="position:relative; border-radius:8px; overflow:hidden;">
+                    <img src="{data_uri}" style="width:100%; aspect-ratio:16/9; object-fit:cover; border-radius:8px;"/>
+                    <div style="position:absolute; bottom:0; left:0; right:0; background:linear-gradient(transparent,rgba(0,0,0,0.85)); padding:6px 8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <span style="color:#e2e8f0; font-size:0.7rem;">#{j+1} ⏱️ {item['time_str']}</span>
+                            <span style="color:{color}; font-size:0.7rem; font-weight:600;">{item['score']:.3f}</span>
+                        </div>
+                    </div>
+                </div>"""
+            
+            cols += f"""
+            <div style="flex:1; min-width:250px;">
+                <div style="color:{color}; font-weight:700; font-size:0.9rem; margin-bottom:8px; text-align:center;">{m}</div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+                    {imgs}
+                </div>
+            </div>"""
+        
+        thumbs_html = f"""
+        <div style="background:#1a1d24; border-radius:12px; padding:16px; border:1px solid #2d3748; margin-top:16px;">
+            <div style="color:#a0aec0; font-size:0.85rem; font-weight:600; margin-bottom:12px;">🖼️ Top Results Comparison</div>
+            <div style="display:flex; gap:16px; flex-wrap:wrap;">
+                {cols}
+            </div>
+        </div>"""
+    
+    return f"""
+    <div style="background:linear-gradient(135deg,#252a34,#1a1d24); border-radius:16px; padding:20px; border:1px solid #2d3748;">
+        <div style="text-align:center; margin-bottom:16px;">
+            <span style="font-size:1.3rem; font-weight:700; color:#e2e8f0;">⚡ Benchmark Results</span>
+            <div style="color:#718096; font-size:0.8rem; margin-top:4px;">Query: "{query}"</div>
+        </div>
+        {trans_html}
+        <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:8px;">
+            {metrics_cards}
+        </div>
+        {bar_chart}
+        {thumbs_html}
+    </div>
+    """
+
+# ============================================================ 
+# EXPORT ENGINE
+# ============================================================ 
+def get_available_embeddings(movie_name):
+    """Get list of models that have embeddings for a movie"""
+    if not movie_name or not is_movie_processed(movie_name):
+        return []
+    available = []
+    # Check default embeddings (ViT-B-32)
+    paths = get_movie_paths(movie_name)
+    if paths['embeddings'].exists():
+        available.append('ViT-B-32')
+    # Check benchmark model embeddings
+    for model_name in BENCHMARK_MODELS:
+        if model_name == 'ViT-B-32':
+            continue
+        emb_path = get_benchmark_emb_path(movie_name, model_name)
+        if emb_path.exists():
+            available.append(model_name)
+    return available
+
+def export_embeddings(movie_name, model_name, fmt="jsonl"):
+    """Export embeddings as JSONL or JSON (generator for progress)"""
+    paths = get_movie_paths(movie_name)
+    
+    # Load metadata
+    with open(paths['metadata'], 'r', encoding='utf-8') as f:
+        meta = json.load(f)
+    frame_list = meta['frames']
+    total = len(frame_list)
+    
+    # Load embeddings
+    if model_name == 'ViT-B-32':
+        emb_path = paths['embeddings']
+    else:
+        emb_path = get_benchmark_emb_path(movie_name, model_name)
+    
+    data = np.load(str(emb_path))
+    img_embs = data.get('image_embeddings', data.get('embeddings'))
+    txt_embs = data.get('text_embeddings')
+    
+    model_info = BENCHMARK_MODELS.get(model_name, {})
+    dim = model_info.get('dim', img_embs.shape[1] if img_embs is not None else 0)
+    
+    # Export directory
+    export_dir = OUTPUT_DIR / movie_name / 'export'
+    export_dir.mkdir(parents=True, exist_ok=True)
+    
+    slug = model_name.replace('-', '_')
+    
+    if fmt == "jsonl":
+        out_path = export_dir / f'{movie_name}_{slug}.jsonl'
+        with open(out_path, 'w', encoding='utf-8') as f:
+            for i, frame in enumerate(frame_list):
+                record = {
+                    'movie': movie_name,
+                    'model': model_name,
+                    'dimension': dim,
+                    'index': i,
+                    'timestamp': frame.get('timestamp', 0),
+                    'time_str': frame.get('time_str', ''),
+                    'filename': frame.get('filename', ''),
+                    'caption': frame.get('caption', ''),
+                    'image_embedding': img_embs[i].tolist() if i < len(img_embs) else [],
+                    'text_embedding': txt_embs[i].tolist() if txt_embs is not None and i < len(txt_embs) else [],
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                
+                if (i + 1) % 20 == 0 or i == total - 1:
+                    yield i + 1, total, None
+        
+        yield total, total, str(out_path)
+    
+    else:  # json
+        out_path = export_dir / f'{movie_name}_{slug}.json'
+        records = []
+        for i, frame in enumerate(frame_list):
+            records.append({
+                'index': i,
+                'timestamp': frame.get('timestamp', 0),
+                'time_str': frame.get('time_str', ''),
+                'filename': frame.get('filename', ''),
+                'caption': frame.get('caption', ''),
+                'image_embedding': img_embs[i].tolist() if i < len(img_embs) else [],
+                'text_embedding': txt_embs[i].tolist() if txt_embs is not None and i < len(txt_embs) else [],
+            })
+            if (i + 1) % 20 == 0 or i == total - 1:
+                yield i + 1, total, None
+        
+        output = {
+            'movie': movie_name,
+            'model': model_name,
+            'dimension': dim,
+            'total_frames': total,
+            'frames': records
+        }
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(output, f, ensure_ascii=False)
+        
+        yield total, total, str(out_path)
 
 # ============================================================ 
 # UI BUILDER
@@ -1088,6 +1728,14 @@ def create_app():
     /* Footer */
     footer { display: none !important; }
     
+    /* Hidden benchmark download trigger buttons */
+    #bench-dl-hidden-row {
+        position: absolute !important;
+        left: -9999px !important;
+        height: 0 !important;
+        overflow: hidden !important;
+    }
+    
     /* Compact file upload area text */
     .compact-upload * {
         font-size: 0.8rem !important;
@@ -1127,7 +1775,34 @@ def create_app():
     }
     """
 
-    with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", radius_size="lg"), css=css, title="SceneSearch") as app:
+    # JS: event delegation for install buttons rendered inside gr.HTML cards
+    # Gradio strips onclick/data-*/class from HTML, so we match by text content
+    # Gradio wraps buttons in a div with the elem_id, so we find the inner <button>
+    install_btn_js = """
+    () => {
+        document.addEventListener('click', (e) => {
+            const el = e.target;
+            if (!el || !el.textContent) return;
+            const txt = el.textContent.trim();
+            const map = {
+                'install:B32': 'bench-dl-b32',
+                'install:B16': 'bench-dl-b16',
+                'install:L14': 'bench-dl-l14',
+                'install:H14': 'bench-dl-h14',
+                'install:g14': 'bench-dl-g14'
+            };
+            if (map[txt]) {
+                const wrapper = document.getElementById(map[txt]);
+                if (wrapper) {
+                    const btn = wrapper.tagName.toLowerCase() === 'button' ? wrapper : wrapper.querySelector('button');
+                    if (btn) btn.click();
+                }
+            }
+        });
+    }
+    """
+
+    with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", radius_size="lg"), css=css, js=install_btn_js, title="SceneSearch") as app:
 
         # State for timestamps
         timestamps_state = gr.State([])
@@ -1241,7 +1916,7 @@ def create_app():
                                 video_input = gr.File(
                                     label="Or upload new video",
                                     file_types=["video"],
-                                    height=100,
+                                    height=120,
                                     elem_classes="compact-upload",
                                 )
                         with gr.Column(scale=1, min_width=400):
@@ -1299,6 +1974,132 @@ def create_app():
                     movie_status_html = gr.HTML(
                         value='<div style="color:#718096; text-align:center; padding:16px;">Select a movie to view status</div>'
                     )
+
+                # ---------------------------------------------------------
+                # TAB 3: BENCHMARK
+                # ---------------------------------------------------------
+                with gr.Tab("📊 Benchmark", id="benchmark_tab"):
+
+                    gr.HTML("""
+                    <div style="text-align:center; padding:8px 0 4px;">
+                        <span style="font-size:1.1rem; font-weight:600; color:#e2e8f0;">CLIP Model Benchmark</span>
+                        <div style="color:#718096; font-size:0.8rem; margin-top:2px;">Compare search quality & speed across different CLIP models</div>
+                    </div>
+                    """)
+
+                    # Movie selection + refresh
+                    with gr.Row():
+                        bench_movie = gr.Dropdown(
+                            choices=get_available_movies(),
+                            label="Select Movie (must be processed first)",
+                            value=None,
+                            scale=4,
+                        )
+                        bench_refresh_btn = gr.Button("🔄", scale=0, min_width=50)
+
+                    # Model cards
+                    bench_status = gr.HTML(
+                        value='<div style="color:#718096; text-align:center; padding:20px; background:#1a1d24; border-radius:12px; border:1px solid #2d3748;">Select a movie to check model status</div>'
+                    )
+                    # Download progress
+                    bench_dl_progress = gr.HTML(visible=False)
+                    
+                    # Hidden trigger buttons (off-screen, functional)
+                    with gr.Row(elem_id="bench-dl-hidden-row"):
+                        bench_dl_b32 = gr.Button("dl_b32", elem_id="bench-dl-b32", size="sm")
+                        bench_dl_b16 = gr.Button("dl_b16", elem_id="bench-dl-b16", size="sm")
+                        bench_dl_l14 = gr.Button("dl_l14", elem_id="bench-dl-l14", size="sm")
+                        bench_dl_h14 = gr.Button("dl_h14", elem_id="bench-dl-h14", size="sm")
+                        bench_dl_g14 = gr.Button("dl_g14", elem_id="bench-dl-g14", size="sm")
+
+                    # Model selection for comparison
+                    bench_models = gr.CheckboxGroup(
+                        choices=list(BENCHMARK_MODELS.keys()),
+                        value=['ViT-B-32', 'ViT-B-16'],
+                        label="Select models to compare",
+                    )
+
+                    # Prepare Embeddings
+                    with gr.Row():
+                        bench_prepare_btn = gr.Button("🔧 Prepare Selected Models", variant="primary", scale=3)
+                    bench_prepare_log = gr.Textbox(
+                        show_label=False,
+                        max_lines=6,
+                        elem_classes="log-area",
+                        interactive=False,
+                        autoscroll=True,
+                        visible=False,
+                    )
+                    bench_prepare_progress = gr.HTML(visible=False)
+
+                    gr.Markdown("---")
+
+                    # Row 3: Search Comparison
+                    gr.Markdown("#### 🔍 Compare Search Results", elem_classes="section-header")
+                    with gr.Row():
+                        bench_query = gr.Textbox(
+                            show_label=False,
+                            placeholder="Enter search query to compare across models...",
+                            lines=1,
+                            elem_classes="search-input",
+                            scale=4,
+                        )
+                        bench_topk = gr.Slider(4, 16, value=8, step=4, label="Results", scale=1)
+                        bench_search_btn = gr.Button("⚡ Compare", variant="primary", scale=1, elem_classes="primary-btn")
+
+                    # Comparison output
+                    bench_comparison = gr.HTML(
+                        value='<div style="background:#1a1d24; border-radius:12px; padding:40px; border:1px solid #2d3748; text-align:center; color:#718096;">Prepare models and enter a query to compare</div>'
+                    )
+
+                # ---------------------------------------------------------
+                # TAB 4: EXPORT DATA
+                # ---------------------------------------------------------
+                with gr.Tab("📦 Export Data", id="export_tab"):
+
+                    gr.HTML("""
+                    <div style="text-align:center; padding:8px 0 4px;">
+                        <span style="font-size:1.1rem; font-weight:600; color:#e2e8f0;">Export Embeddings</span>
+                        <div style="color:#718096; font-size:0.8rem; margin-top:2px;">임베딩 데이터를 JSON/JSONL로 내보내기</div>
+                    </div>
+                    """)
+
+                    with gr.Row(equal_height=True):
+                        with gr.Column(scale=1, min_width=300):
+                            export_movie = gr.Dropdown(
+                                choices=get_available_movies(),
+                                label="Movie",
+                                value=None,
+                            )
+                            export_model = gr.Dropdown(
+                                choices=[],
+                                label="Model (available embeddings)",
+                                value=None,
+                            )
+                        with gr.Column(scale=1, min_width=300):
+                            export_format = gr.Radio(
+                                choices=["JSONL", "JSON"],
+                                value="JSONL",
+                                label="Format",
+                            )
+                            gr.HTML("""
+                            <div style="background:#1e222b; border-radius:8px; padding:10px 14px; border:1px solid #2d374833; margin-top:4px;">
+                                <div style="color:#a0aec0; font-size:0.75rem; margin-bottom:6px; font-weight:600;">Format Guide</div>
+                                <div style="color:#718096; font-size:0.7rem; line-height:1.5;">
+                                    <b style="color:#48bb78;">JSONL</b> — 한 줄에 프레임 하나. Elasticsearch bulk 인덱싱에 최적<br/>
+                                    <b style="color:#667eea;">JSON</b> — 영화 전체가 하나의 구조. 전체 데이터를 한번에 볼 때 유용
+                                </div>
+                            </div>
+                            """)
+
+                    with gr.Row():
+                        export_btn = gr.Button("📦 Export", variant="primary", scale=3)
+                        export_refresh = gr.Button("🔄", scale=0, min_width=50)
+
+                    export_progress = gr.HTML(
+                        value='<div style="background:#1a1d24; border-radius:12px; padding:30px; border:1px solid #2d3748; text-align:center; color:#718096;">Select a movie and model to export</div>'
+                    )
+                    export_file = gr.File(label="Download", visible=False, interactive=False)
 
         # ---------------------------------------------------------
         # EVENT HANDLERS
@@ -1494,6 +2295,261 @@ def create_app():
             outputs=[movie_status_html, manage_dropdown]
         )
 
+        # ---------------------------------------------------------
+        # BENCHMARK EVENT HANDLERS
+        # ---------------------------------------------------------
+
+        def generate_bench_status_html(movie_name, downloading_model=None):
+            """Generate model status cards (supports inline progress bar during download)"""
+            default_html = '<div style="color:#718096; text-align:center; padding:20px; background:#1a1d24; border-radius:12px; border:1px solid #2d3748;">Select a movie to check model status</div>'
+            
+            if not movie_name:
+                return default_html
+            if not is_movie_processed(movie_name):
+                return f'<div style="color:#f59e0b; text-align:center; padding:16px; background:#1a1d24; border-radius:12px; border:1px solid #f59e0b33;">⚠️ {movie_name} needs processing first (Process tab)</div>'
+            
+            emb_status = benchmark_check_status(movie_name)
+            colors = {'ViT-B-32': '#667eea', 'ViT-B-16': '#f59e0b', 'ViT-L-14': '#48bb78', 'ViT-H-14': '#ec4899', 'ViT-g-14': '#ef4444'}
+            install_keys = {'ViT-B-32': 'install:B32', 'ViT-B-16': 'install:B16', 'ViT-L-14': 'install:L14', 'ViT-H-14': 'install:H14', 'ViT-g-14': 'install:g14'}
+            
+            cards = ""
+            for model_name in BENCHMARK_MODELS:
+                info = BENCHMARK_MODELS[model_name]
+                color = colors[model_name]
+                downloaded = is_model_downloaded(model_name)
+                emb_ready = emb_status.get(model_name, False)
+                ikey = install_keys[model_name]
+                
+                # Download status: progress bar / installed / install button
+                if model_name == downloading_model:
+                    slug = model_name.replace('-', '')
+                    dl_html = f'''<div style="display:flex;align-items:center;gap:6px;width:100%;">
+                        <span style="font-size:0.65rem;">⬇️</span>
+                        <div style="flex:1;background:#2d3748;border-radius:4px;height:6px;overflow:hidden;position:relative;">
+                            <style>@keyframes dlSlide_{slug} {{ 0% {{ left:-100%; }} 100% {{ left:100%; }} }}</style>
+                            <div style="position:absolute;top:0;bottom:0;width:50%;background:{color};border-radius:4px;animation:dlSlide_{slug} 1.5s linear infinite;"></div>
+                        </div>
+                        <span style="color:{color};font-size:0.6rem;font-weight:600;white-space:nowrap;">Downloading...</span>
+                    </div>'''
+                elif downloaded:
+                    dl_html = '<div style="display:flex;align-items:center;gap:4px;"><span style="font-size:0.65rem;">📦</span><span style="color:#48bb78;font-size:0.7rem;">Installed</span></div>'
+                else:
+                    dl_html = f'''<div style="display:flex;align-items:center;gap:6px;">
+                        <span style="font-size:0.65rem;">⬇️</span>
+                        <span style="color:#f59e0b;font-size:0.7rem;">Not installed</span>
+                        <span style="cursor:pointer;background:#f59e0b22;border:1px solid #f59e0b55;border-radius:5px;padding:1px 6px;font-size:0.55rem;color:#f59e0b;font-weight:600;display:inline-flex;align-items:center;gap:2px;user-select:none;">{ikey}</span>
+                    </div>'''
+                
+                emb_html = '<div style="display:flex;align-items:center;gap:4px;"><span style="font-size:0.65rem;">✅</span><span style="color:#48bb78;font-size:0.7rem;">Embeddings ready</span></div>' if emb_ready else '<div style="display:flex;align-items:center;gap:4px;"><span style="font-size:0.65rem;">⬜</span><span style="color:#718096;font-size:0.7rem;">Not prepared</span></div>'
+                
+                cards += f'''<div style="flex:1;min-width:170px;background:#1e222b;border-radius:10px;padding:12px 14px;border:1px solid {color}33;position:relative;overflow:hidden;">
+                    <div style="position:absolute;top:0;left:0;right:0;height:2px;background:{color};"></div>
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                        <span style="color:{color};font-weight:700;font-size:0.9rem;">{model_name}</span>
+                        <span style="color:#4a5568;font-size:0.6rem;background:#252a34;padding:2px 6px;border-radius:8px;">{info['params']}</span>
+                    </div>
+                    <div style="color:#718096;font-size:0.65rem;margin-bottom:8px;">{info['dim']}d · Patch {info['patch']} · {info['desc']}</div>
+                    <div style="display:flex;flex-direction:column;gap:3px;min-height:30px;justify-content:center;">{dl_html}{emb_html}</div>
+                </div>'''
+            
+            return f'<div style="display:flex;gap:10px;flex-wrap:wrap;">{cards}</div>'
+
+        def on_bench_movie_select(movie_name):
+            return generate_bench_status_html(movie_name)
+
+        bench_movie.change(
+            fn=on_bench_movie_select,
+            inputs=[bench_movie],
+            outputs=[bench_status]
+        )
+
+        def on_bench_refresh():
+            return gr.update(choices=get_available_movies())
+
+        bench_refresh_btn.click(
+            fn=on_bench_refresh,
+            inputs=[],
+            outputs=[bench_movie]
+        )
+
+        def do_bench_dl_single_gen(model_name, movie_name):
+            """Download a single model with card-inline progress"""
+            if is_model_downloaded(model_name):
+                yield generate_bench_status_html(movie_name)
+                return
+            # Show progress bar inside the card
+            yield generate_bench_status_html(movie_name, downloading_model=model_name)
+            # Download
+            info = BENCHMARK_MODELS[model_name]
+            try:
+                m, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=info['pretrained'])
+                del m
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            except Exception as e:
+                print(f"[!] Failed to download {model_name}: {e}")
+            # Refresh card state
+            yield generate_bench_status_html(movie_name)
+
+        # Factory function to avoid lambda+generator issue
+        def make_dl_handler(mname):
+            def handler(movie_name):
+                yield from do_bench_dl_single_gen(mname, movie_name)
+            return handler
+
+        for btn, mname in [(bench_dl_b32, 'ViT-B-32'), (bench_dl_b16, 'ViT-B-16'), (bench_dl_l14, 'ViT-L-14'), (bench_dl_h14, 'ViT-H-14'), (bench_dl_g14, 'ViT-g-14')]:
+            btn.click(
+                fn=make_dl_handler(mname),
+                inputs=[bench_movie],
+                outputs=[bench_status]
+            )
+
+        def do_bench_prepare(movie_name, model_names):
+            if not movie_name:
+                yield "❌ Select a movie first", "", None
+                return
+            if not model_names:
+                yield "❌ Select at least one model", "", None
+                return
+            
+            for model_name in model_names:
+                # Skip if already exists
+                emb_path = get_benchmark_emb_path(movie_name, model_name)
+                default_path = get_movie_paths(movie_name)['embeddings']
+                if emb_path.exists() or (model_name == 'ViT-B-32' and default_path.exists()):
+                    yield f"⏭️ {model_name} already prepared, skipping...", _bench_progress_html(model_name, "done", 1, 1), None
+                    continue
+                
+                for log_msg, prog_html, _ in benchmark_generate(movie_name, model_name):
+                    yield log_msg, prog_html, None
+
+        bench_prepare_btn.click(
+            fn=lambda: (gr.update(visible=True), gr.update(visible=True)),
+            inputs=[],
+            outputs=[bench_prepare_log, bench_prepare_progress]
+        ).then(
+            fn=do_bench_prepare,
+            inputs=[bench_movie, bench_models],
+            outputs=[bench_prepare_log, bench_prepare_progress, bench_status]
+        ).then(
+            fn=on_bench_movie_select,
+            inputs=[bench_movie],
+            outputs=[bench_status]
+        )
+
+        def do_bench_search(movie_name, model_names, query, top_k):
+            if not movie_name or not query.strip() or not model_names:
+                return '<div style="color:#718096; text-align:center; padding:40px; background:#1a1d24; border-radius:12px; border:1px solid #2d3748;">Select movie, models, and enter a query</div>'
+            html, _ = benchmark_search_compare(movie_name, model_names, query, int(top_k))
+            return html
+
+        bench_search_btn.click(
+            fn=do_bench_search,
+            inputs=[bench_movie, bench_models, bench_query, bench_topk],
+            outputs=[bench_comparison]
+        )
+        bench_query.submit(
+            fn=do_bench_search,
+            inputs=[bench_movie, bench_models, bench_query, bench_topk],
+            outputs=[bench_comparison]
+        )
+
+        # ---------------------------------------------------------
+        # EXPORT EVENT HANDLERS
+        # ---------------------------------------------------------
+
+        def on_export_movie_select(movie_name):
+            """Update model dropdown based on available embeddings"""
+            models = get_available_embeddings(movie_name)
+            default_val = models[0] if models else None
+            return gr.update(choices=models, value=default_val)
+
+        export_movie.change(
+            fn=on_export_movie_select,
+            inputs=[export_movie],
+            outputs=[export_model]
+        )
+
+        def on_export_refresh():
+            return gr.update(choices=get_available_movies())
+
+        export_refresh.click(
+            fn=on_export_refresh,
+            inputs=[],
+            outputs=[export_movie]
+        )
+
+        def do_export(movie_name, model_name, fmt):
+            """Export embeddings with progress"""
+            if not movie_name or not model_name:
+                yield '<div style="color:#f59e0b; text-align:center; padding:20px; background:#1a1d24; border-radius:12px; border:1px solid #f59e0b33;">Select a movie and model first</div>', gr.update(visible=False)
+                return
+            
+            fmt_key = "jsonl" if fmt == "JSONL" else "json"
+            model_info = BENCHMARK_MODELS.get(model_name, {})
+            color = {'ViT-B-32': '#667eea', 'ViT-B-16': '#f59e0b', 'ViT-L-14': '#48bb78', 'ViT-H-14': '#ec4899', 'ViT-g-14': '#ef4444'}.get(model_name, '#667eea')
+            
+            out_path = None
+            for current, total, path in export_embeddings(movie_name, model_name, fmt_key):
+                pct = current / total * 100
+                if path:
+                    out_path = path
+                
+                if out_path:
+                    # Done
+                    import os
+                    file_size = os.path.getsize(out_path)
+                    size_str = f"{file_size / 1024 / 1024:.1f} MB" if file_size > 1024 * 1024 else f"{file_size / 1024:.1f} KB"
+                    yield f'''
+                    <div style="background:#1a1d24; border-radius:12px; padding:16px; border:1px solid #22c55e44;">
+                        <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px;">
+                            <span style="font-size:1.5rem;">✅</span>
+                            <div>
+                                <div style="color:#48bb78; font-size:1rem; font-weight:600;">Export Complete</div>
+                                <div style="color:#6ee7b7; font-size:0.8rem;">{total} frames exported</div>
+                            </div>
+                        </div>
+                        <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                            <div style="background:#252a34; border-radius:8px; padding:8px 12px;">
+                                <div style="color:#718096; font-size:0.65rem;">FILE</div>
+                                <div style="color:#e2e8f0; font-size:0.8rem; font-weight:500; word-break:break-all;">{os.path.basename(out_path)}</div>
+                            </div>
+                            <div style="background:#252a34; border-radius:8px; padding:8px 12px;">
+                                <div style="color:#718096; font-size:0.65rem;">SIZE</div>
+                                <div style="color:#e2e8f0; font-size:0.8rem; font-weight:500;">{size_str}</div>
+                            </div>
+                            <div style="background:#252a34; border-radius:8px; padding:8px 12px;">
+                                <div style="color:#718096; font-size:0.65rem;">MODEL</div>
+                                <div style="color:{color}; font-size:0.8rem; font-weight:500;">{model_name}</div>
+                            </div>
+                            <div style="background:#252a34; border-radius:8px; padding:8px 12px;">
+                                <div style="color:#718096; font-size:0.65rem;">FORMAT</div>
+                                <div style="color:#e2e8f0; font-size:0.8rem; font-weight:500;">{fmt}</div>
+                            </div>
+                        </div>
+                    </div>''', gr.update(visible=True, value=out_path)
+                else:
+                    # In progress
+                    yield f'''
+                    <div style="background:#1a1d24; border-radius:12px; padding:16px; border:1px solid {color}33;">
+                        <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px;">
+                            <span style="font-size:1.2rem;">📦</span>
+                            <div style="flex:1;">
+                                <div style="color:#e2e8f0; font-size:0.9rem; font-weight:600;">Exporting {movie_name}</div>
+                                <div style="color:#718096; font-size:0.75rem;">{model_name} · {fmt} · {current}/{total} frames</div>
+                            </div>
+                            <div style="color:{color}; font-size:1.1rem; font-weight:700;">{pct:.0f}%</div>
+                        </div>
+                        <div style="background:#2d3748; border-radius:6px; height:8px; overflow:hidden;">
+                            <div style="background:{color}; height:100%; width:{pct}%; border-radius:6px; transition:width 0.3s;"></div>
+                        </div>
+                    </div>''', gr.update(visible=False)
+
+        export_btn.click(
+            fn=do_export,
+            inputs=[export_movie, export_model, export_format],
+            outputs=[export_progress, export_file]
+        )
+
     return app
 
 if __name__ == "__main__":
@@ -1502,5 +2558,6 @@ if __name__ == "__main__":
     app.launch(
         server_name="127.0.0.1",
         server_port=7880,
-        inbrowser=True
+        inbrowser=True,
+        allowed_paths=[str(OUTPUT_DIR)]
     )

@@ -11,6 +11,7 @@ output/*/frames/
 output/*/embeddings.npz
 output/*/metadata.json
 output/*/frame_log.txt
+output/*/export/
 
 # Legacy output paths (keep for compatibility)
 output/frames/
