@@ -1268,7 +1268,61 @@ def benchmark_search_compare(movie_name, model_names, query, top_k=8):
             gallery = [(item['path'], f"⏱️ {item['time_str']} | {item['score']:.3f}") for item in r.get('results', [])]
             all_galleries.append(gallery)
     
-    return html, all_galleries
+    # Build saveable raw data (strip image paths for portability)
+    save_data = {
+        'movie': movie_name,
+        'query': query,
+        'translated_query': translated,
+        'top_k': top_k,
+        'models': {}
+    }
+    for model_name in model_names:
+        r = results_per_model.get(model_name, {})
+        if 'error' in r:
+            save_data['models'][model_name] = {'error': r['error']}
+        else:
+            save_data['models'][model_name] = {
+                'params': r.get('params', ''),
+                'dim': r.get('dim', 0),
+                'top_score': r['results'][0]['score'] if r['results'] else 0,
+                'search_ms': round(r['search_time'] * 1000, 2),
+                'encode_ms': round(r['encode_time'] * 1000, 2),
+                'total_ms': round(r['total_time'] * 1000, 2),
+                'vram_mb': round(r.get('vram_mb', 0), 1),
+                'results': [
+                    {
+                        'rank': i + 1,
+                        'score': round(item['score'], 5),
+                        'timestamp': item['timestamp'],
+                        'time_str': item['time_str'],
+                        'filename': item.get('path', '').split('\\')[-1].split('/')[-1],
+                        'caption': item.get('caption', ''),
+                    }
+                    for i, item in enumerate(r.get('results', []))
+                ]
+            }
+    
+    # Add overlap analysis to save data
+    valid_model_names = [m for m in model_names if 'error' not in results_per_model.get(m, {'error': True})]
+    if len(valid_model_names) >= 2:
+        base = valid_model_names[0]
+        base_files = set(item.get('path', '').split('\\')[-1].split('/')[-1] for item in results_per_model[base].get('results', []))
+        overlap_data = {}
+        for m in valid_model_names[1:]:
+            other_files = set(item.get('path', '').split('\\')[-1].split('/')[-1] for item in results_per_model[m].get('results', []))
+            overlap = base_files & other_files
+            diff = other_files - base_files
+            total = len(base_files)
+            overlap_data[m] = {
+                'vs_base': base,
+                'overlap_count': len(overlap),
+                'different_count': len(diff),
+                'total': total,
+                'overlap_pct': round(len(overlap) / total * 100, 1) if total > 0 else 0
+            }
+        save_data['overlap_analysis'] = overlap_data
+    
+    return html, all_galleries, save_data
 
 def _img_to_data_uri(path, max_w=320):
     """Convert image file to base64 data URI (resized for thumbnails)"""
@@ -1311,9 +1365,9 @@ def _build_comparison_html(results_per_model, query, translated, top_k):
         
         if 'error' in r:
             metrics_cards += f"""
-            <div style="flex:1; min-width:200px; background:#1a1d24; border-radius:12px; padding:16px; border:1px solid #2d3748;">
-                <div style="color:{color}; font-weight:700; font-size:1rem; margin-bottom:8px;">{model_name}</div>
-                <div style="color:#fc8181; font-size:0.85rem;">{r['error']}</div>
+            <div style="flex:1; min-width:0; background:#1a1d24; border-radius:12px; padding:12px; border:1px solid #2d3748;">
+                <div style="color:{color}; font-weight:700; font-size:0.85rem; margin-bottom:6px;">{model_name}</div>
+                <div style="color:#fc8181; font-size:0.75rem;">{r['error']}</div>
             </div>"""
             continue
         
@@ -1322,59 +1376,84 @@ def _build_comparison_html(results_per_model, query, translated, top_k):
         search_ms = r['search_time'] * 1000
         
         metrics_cards += f"""
-        <div style="flex:1; min-width:220px; background:#1a1d24; border-radius:12px; padding:16px; border:1px solid {color}33; position:relative; overflow:hidden;">
+        <div style="flex:1; min-width:0; background:#1a1d24; border-radius:12px; padding:12px; border:1px solid {color}33; position:relative; overflow:hidden;">
             <div style="position:absolute; top:0; left:0; right:0; height:3px; background:{color};"></div>
-            <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
-                <span style="color:{color}; font-weight:700; font-size:1.05rem;">{model_name}</span>
-                <span style="color:#4a5568; font-size:0.7rem; background:#252a34; padding:2px 8px; border-radius:10px;">{r['params']} · {r['dim']}d</span>
+            <div style="display:flex; align-items:center; gap:4px; margin-bottom:8px;">
+                <span style="color:{color}; font-weight:700; font-size:0.85rem;">{model_name}</span>
+                <span style="color:#4a5568; font-size:0.55rem; background:#252a34; padding:1px 5px; border-radius:8px;">{r['params']} · {r['dim']}d</span>
             </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-                <div style="background:#252a34; border-radius:8px; padding:8px 10px;">
-                    <div style="color:#718096; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.5px;">Top Score</div>
-                    <div style="color:#e2e8f0; font-size:1.1rem; font-weight:700;">{top_score:.4f}</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px;">
+                <div style="background:#252a34; border-radius:6px; padding:6px 8px;">
+                    <div style="color:#718096; font-size:0.55rem; text-transform:uppercase; letter-spacing:0.5px;">Top Score</div>
+                    <div style="color:#e2e8f0; font-size:0.9rem; font-weight:700;">{top_score:.4f}</div>
                 </div>
-                <div style="background:#252a34; border-radius:8px; padding:8px 10px;">
-                    <div style="color:#718096; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.5px;">Search</div>
-                    <div style="color:#48bb78; font-size:1.1rem; font-weight:700;">{search_ms:.1f}ms</div>
+                <div style="background:#252a34; border-radius:6px; padding:6px 8px;">
+                    <div style="color:#718096; font-size:0.55rem; text-transform:uppercase; letter-spacing:0.5px;">Search</div>
+                    <div style="color:#48bb78; font-size:0.9rem; font-weight:700;">{search_ms:.1f}ms</div>
                 </div>
-                <div style="background:#252a34; border-radius:8px; padding:8px 10px;">
-                    <div style="color:#718096; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.5px;">Total</div>
-                    <div style="color:#a0aec0; font-size:1.1rem; font-weight:700;">{total_ms:.0f}ms</div>
+                <div style="background:#252a34; border-radius:6px; padding:6px 8px;">
+                    <div style="color:#718096; font-size:0.55rem; text-transform:uppercase; letter-spacing:0.5px;">Total</div>
+                    <div style="color:#a0aec0; font-size:0.9rem; font-weight:700;">{total_ms:.0f}ms</div>
                 </div>
-                <div style="background:#252a34; border-radius:8px; padding:8px 10px;">
-                    <div style="color:#718096; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.5px;">VRAM</div>
-                    <div style="color:#a0aec0; font-size:1.1rem; font-weight:700;">{r['vram_mb']:.0f}MB</div>
+                <div style="background:#252a34; border-radius:6px; padding:6px 8px;">
+                    <div style="color:#718096; font-size:0.55rem; text-transform:uppercase; letter-spacing:0.5px;">VRAM</div>
+                    <div style="color:#a0aec0; font-size:0.9rem; font-weight:700;">{r['vram_mb']:.0f}MB</div>
                 </div>
             </div>
         </div>"""
     
-    # Score comparison bar chart (top-1 scores)
-    bar_chart = ""
+    # Score comparison bar chart removed - scores not comparable across models (different vector spaces)
+    
     valid_models = [(m, r) for m, r in results_per_model.items() if 'results' in r and r['results']]
+
+    # Result Overlap Analysis (base model = first model, typically ViT-B-32)
+    overlap_html = ""
     if len(valid_models) >= 2:
-        max_score = max(r['results'][0]['score'] for _, r in valid_models)
-        bars = ""
-        for i, (m, r) in enumerate(valid_models):
-            score = r['results'][0]['score']
-            width_pct = (score / max_score * 100) if max_score > 0 else 0
+        base_name, base_r = valid_models[0]
+        base_color = colors[0]
+        base_filenames = set(item.get('path', '').split('\\')[-1].split('/')[-1] for item in base_r['results'])
+        
+        overlap_rows = ""
+        for i, (m, r) in enumerate(valid_models[1:], 1):
             color = colors[i % len(colors)]
-            bars += f"""
-            <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
-                <div style="width:70px; color:{color}; font-size:0.8rem; font-weight:600; text-align:right;">{m}</div>
-                <div style="flex:1; background:#252a34; border-radius:4px; height:24px; overflow:hidden;">
-                    <div style="background:{color}; height:100%; width:{width_pct:.1f}%; border-radius:4px; display:flex; align-items:center; justify-content:flex-end; padding-right:8px;">
-                        <span style="color:white; font-size:0.7rem; font-weight:600;">{score:.4f}</span>
-                    </div>
+            other_filenames = set(item.get('path', '').split('\\')[-1].split('/')[-1] for item in r['results'])
+            
+            overlap = base_filenames & other_filenames
+            diff = other_filenames - base_filenames
+            total = len(base_r['results'])
+            overlap_count = len(overlap)
+            diff_count = len(diff)
+            pct = (overlap_count / total * 100) if total > 0 else 0
+            
+            # Bar visualization
+            bar_filled = f"background:{color}; width:{pct}%; height:100%; border-radius:6px; transition:width 0.5s;"
+            bar_bg = "background:#252a34; border-radius:6px; height:10px; overflow:hidden; flex:1;"
+            
+            overlap_rows += f"""
+            <div style="display:flex; align-items:center; gap:12px; padding:10px 14px; background:#1e222b; border-radius:10px; margin-bottom:6px;">
+                <div style="width:80px; color:{color}; font-weight:700; font-size:0.85rem; text-align:right;">{m}</div>
+                <div style="{bar_bg}"><div style="{bar_filled}"></div></div>
+                <div style="display:flex; gap:12px; min-width:200px;">
+                    <span style="color:#48bb78; font-size:0.8rem; font-weight:600;">✓ {overlap_count} same</span>
+                    <span style="color:#f59e0b; font-size:0.8rem; font-weight:600;">★ {diff_count} new</span>
+                    <span style="color:#e2e8f0; font-size:0.9rem; font-weight:700;">{pct:.0f}%</span>
                 </div>
             </div>"""
         
-        bar_chart = f"""
+        overlap_html = f"""
         <div style="background:#1a1d24; border-radius:12px; padding:16px; border:1px solid #2d3748; margin-top:16px;">
-            <div style="color:#a0aec0; font-size:0.85rem; font-weight:600; margin-bottom:12px;">📊 Top-1 Score Comparison</div>
-            {bars}
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:14px;">
+                <span style="font-size:1rem;">🔀</span>
+                <span style="color:#a0aec0; font-size:0.85rem; font-weight:600;">Result Overlap vs {base_name}</span>
+                <span style="color:#4a5568; font-size:0.7rem; background:#252a34; padding:2px 8px; border-radius:8px;">Top {len(base_r['results'])} results</span>
+            </div>
+            {overlap_rows}
+            <div style="color:#4a5568; font-size:0.65rem; margin-top:8px; text-align:center;">
+                ✓ same = identical frames found · ★ new = different frames only this model found · % = overlap rate (lower = more unique results)
+            </div>
         </div>"""
-    
-    # Result thumbnails side by side
+
+    # Result thumbnails - 2 models per row with larger thumbnails
     thumbs_html = ""
     if len(valid_models) >= 2:
         cols = ""
@@ -1382,22 +1461,25 @@ def _build_comparison_html(results_per_model, query, translated, top_k):
             color = colors[i % len(colors)]
             imgs = ""
             for j, item in enumerate(r['results'][:4]):
-                data_uri = _img_to_data_uri(item['path'])
+                data_uri = _img_to_data_uri(item['path'], max_w=480)
+                caption = item.get('caption', '')
+                short_cap = (caption[:50] + '..') if len(caption) > 50 else caption
                 imgs += f"""
                 <div style="position:relative; border-radius:8px; overflow:hidden;">
                     <img src="{data_uri}" style="width:100%; aspect-ratio:16/9; object-fit:cover; border-radius:8px;"/>
-                    <div style="position:absolute; bottom:0; left:0; right:0; background:linear-gradient(transparent,rgba(0,0,0,0.85)); padding:6px 8px;">
+                    <div style="position:absolute; bottom:0; left:0; right:0; background:linear-gradient(transparent,rgba(0,0,0,0.85)); padding:8px 10px;">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <span style="color:#e2e8f0; font-size:0.7rem;">#{j+1} ⏱️ {item['time_str']}</span>
-                            <span style="color:{color}; font-size:0.7rem; font-weight:600;">{item['score']:.3f}</span>
+                            <span style="color:#e2e8f0; font-size:0.75rem;">#{j+1} ⏱️ {item['time_str']}</span>
+                            <span style="color:{color}; font-size:0.75rem; font-weight:600;">{item['score']:.3f}</span>
                         </div>
+                        <div style="color:#a0aec0; font-size:0.6rem; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{short_cap}</div>
                     </div>
                 </div>"""
             
             cols += f"""
-            <div style="flex:1; min-width:250px;">
-                <div style="color:{color}; font-weight:700; font-size:0.9rem; margin-bottom:8px; text-align:center;">{m}</div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+            <div style="width:calc(50% - 8px); min-width:0;">
+                <div style="color:{color}; font-weight:700; font-size:0.95rem; margin-bottom:8px; text-align:center;">{m}</div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
                     {imgs}
                 </div>
             </div>"""
@@ -1417,13 +1499,78 @@ def _build_comparison_html(results_per_model, query, translated, top_k):
             <div style="color:#718096; font-size:0.8rem; margin-top:4px;">Query: "{query}"</div>
         </div>
         {trans_html}
-        <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:8px;">
+        <div style="display:flex; gap:10px; flex-wrap:nowrap; margin-bottom:8px;">
             {metrics_cards}
         </div>
-        {bar_chart}
+        {overlap_html}
         {thumbs_html}
     </div>
     """
+
+def save_benchmark_results(save_data):
+    """Save benchmark results to JSON file with auto-generated filename
+    Returns: (status_html, file_path or None)
+    """
+    if not save_data or not save_data.get('models'):
+        return "⚠️ No benchmark results to save. Run a comparison first.", None
+    
+    timestamp = time.strftime("%Y-%m-%d_%H%M%S")
+    query = save_data.get('query', 'unknown')
+    movie = save_data.get('movie', 'unknown')
+    
+    # Auto-generate filename from query
+    safe_query = re.sub(r'[\\/:*?"<>|\s]+', '_', query)[:30].strip('_')
+    safe_movie = re.sub(r'[\\/:*?"<>|\s]+', '_', movie)[:20].strip('_')
+    
+    # Save directory
+    bench_dir = OUTPUT_DIR / 'benchmark'
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Build final save object
+    result = {
+        'saved_at': time.strftime("%Y-%m-%d %H:%M:%S"),
+        'movie': movie,
+        'query': query,
+        'translated_query': save_data.get('translated_query'),
+        'top_k': save_data['top_k'],
+        'models': save_data['models'],
+        'overlap_analysis': save_data.get('overlap_analysis', {}),
+    }
+    
+    filename = f"{timestamp}_{safe_movie}_{safe_query}.json"
+    filepath = bench_dir / filename
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    
+    # Save HTML snapshot (with embedded thumbnail images)
+    snapshot_html = save_data.get('_snapshot_html', '')
+    snapshot_filename = ""
+    if snapshot_html:
+        snapshot_filename = f"{timestamp}_{safe_movie}_{safe_query}.html"
+        snapshot_path = bench_dir / snapshot_filename
+        html_page = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Benchmark: {query} - {movie}</title>
+<style>body{{margin:0;padding:20px;background:#0f1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}}
+.meta{{color:#718096;text-align:center;font-size:0.8rem;margin-bottom:16px;}}</style></head>
+<body><div class="meta">Saved: {time.strftime("%Y-%m-%d %H:%M:%S")} · Movie: {movie} · Query: "{query}"</div>
+{snapshot_html}</body></html>"""
+        with open(snapshot_path, 'w', encoding='utf-8') as f:
+            f.write(html_page)
+    
+    model_count = len([m for m in result['models'].values() if 'error' not in m])
+    snapshot_msg = f" + {snapshot_filename}" if snapshot_filename else ""
+    
+    status_html = f"""
+    <div style="background:#1a1d24; border-radius:12px; padding:14px; border:1px solid #22c55e44; display:flex; align-items:center; gap:12px;">
+        <span style="font-size:1.5rem;">✅</span>
+        <div style="flex:1;">
+            <div style="color:#48bb78; font-weight:600;">Saved!</div>
+            <div style="color:#718096; font-size:0.8rem;">{filename}{snapshot_msg} · {model_count} models · query: "{query}"</div>
+        </div>
+    </div>
+    """
+    return status_html, str(filepath)
 
 # ============================================================ 
 # EXPORT ENGINE
@@ -2049,8 +2196,15 @@ def create_app():
 
                     # Comparison output
                     bench_comparison = gr.HTML(
-                        value='<div style="background:#1a1d24; border-radius:12px; padding:40px; border:1px solid #2d3748; text-align:center; color:#718096;">Prepare models and enter a query to compare</div>'
+                        value='<div style="background:#1a1d24; border-radius:12px; padding:16px; border:1px solid #2d3748; text-align:center; color:#718096;">Prepare models and enter a query to compare</div>'
                     )
+
+                    # Save Results Section
+                    with gr.Row():
+                        bench_save_btn = gr.Button("💾 Save Results", variant="secondary", scale=1)
+                    bench_save_status = gr.HTML(visible=False)
+                    bench_save_file = gr.File(label="Download", visible=False, interactive=False)
+                    bench_save_data = gr.State(None)
 
                 # ---------------------------------------------------------
                 # TAB 4: EXPORT DATA
@@ -2438,19 +2592,33 @@ def create_app():
 
         def do_bench_search(movie_name, model_names, query, top_k):
             if not movie_name or not query.strip() or not model_names:
-                return '<div style="color:#718096; text-align:center; padding:40px; background:#1a1d24; border-radius:12px; border:1px solid #2d3748;">Select movie, models, and enter a query</div>'
-            html, _ = benchmark_search_compare(movie_name, model_names, query, int(top_k))
-            return html
+                return '<div style="color:#718096; text-align:center; padding:16px; background:#1a1d24; border-radius:12px; border:1px solid #2d3748;">Select movie, models, and enter a query</div>', None
+            html, _, save_data = benchmark_search_compare(movie_name, model_names, query, int(top_k))
+            save_data['_snapshot_html'] = html
+            return html, save_data
 
         bench_search_btn.click(
             fn=do_bench_search,
             inputs=[bench_movie, bench_models, bench_query, bench_topk],
-            outputs=[bench_comparison]
+            outputs=[bench_comparison, bench_save_data]
         )
         bench_query.submit(
             fn=do_bench_search,
             inputs=[bench_movie, bench_models, bench_query, bench_topk],
-            outputs=[bench_comparison]
+            outputs=[bench_comparison, bench_save_data]
+        )
+
+        # Save benchmark results
+        def do_bench_save(save_data):
+            status_html, filepath = save_benchmark_results(save_data)
+            if filepath:
+                return gr.update(visible=True, value=status_html), gr.update(visible=True, value=filepath)
+            return gr.update(visible=True, value=status_html), gr.update(visible=False)
+
+        bench_save_btn.click(
+            fn=do_bench_save,
+            inputs=[bench_save_data],
+            outputs=[bench_save_status, bench_save_file]
         )
 
         # ---------------------------------------------------------
